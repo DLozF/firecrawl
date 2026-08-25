@@ -20,6 +20,8 @@ type SubmitArgs = {
   pagesProcessed: number | undefined;
   mode: PDFMode | undefined;
   includePageMarkdown: boolean;
+  includeBlocks: boolean;
+  pageMarkers: boolean;
   deadlineAt: string;
   /** Team's sold concurrency from the ACUC (ENG-5049 account context).
    * Optional: entitlement lookup must never block or fail a scrape. */
@@ -60,6 +62,8 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
     pagesProcessed,
     mode,
     includePageMarkdown,
+    includeBlocks,
+    pageMarkers,
     deadlineAt,
     teamConcurrency,
     fetchImpl,
@@ -89,6 +93,13 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
       ...(maxPages !== undefined && { max_pages: maxPages }),
       ...(mode !== undefined && { mode }),
       ...(includePageMarkdown && { include_page_markdown: true }),
+      ...(includeBlocks && { include_blocks: true }),
+      // Intentionally camelCase, unlike its siblings: the fire-pdf async
+      // /jobs options schema named this key `pageMarkers` (fire-pdf
+      // api/src/http/schemas/jobs.ts) while the sync /ocr path uses
+      // `page_markers`. Sending snake_case here would be rejected as an
+      // unknown option.
+      ...(pageMarkers && { pageMarkers: true }),
     },
   };
 

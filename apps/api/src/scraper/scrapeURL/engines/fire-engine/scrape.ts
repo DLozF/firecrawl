@@ -30,6 +30,7 @@ const browserCookieSchema = z
 export type FireEngineScrapeRequestCommon = {
   url: string;
   scrapeId?: string;
+  format?: "html" | "rawBase64";
 
   headers?: { [K: string]: string };
 
@@ -49,6 +50,7 @@ export type FireEngineScrapeRequestCommon = {
   geolocation?: { country?: string; languages?: string[] };
 
   mobileProxy?: boolean; // leave it undefined if user doesn't specify
+  autoProxy?: boolean;
 
   timeout?: number;
   maxAge?: number;

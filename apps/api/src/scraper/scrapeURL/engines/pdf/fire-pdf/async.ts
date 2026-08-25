@@ -38,6 +38,8 @@ export async function scrapePDFWithFirePDFAsync(
   mode?: PDFMode,
   deps: FirePdfAsyncDeps = {},
   includePageMarkdown = false,
+  includeBlocks = false,
+  pageMarkers = false,
 ): Promise<PDFProcessorResult> {
   const fetchImpl = deps.fetchImpl ?? undiciFetch;
   const fallbackImpl = deps.fallbackImpl ?? scrapePDFWithFirePDF;
@@ -55,6 +57,8 @@ export async function scrapePDFWithFirePDFAsync(
       pagesProcessed,
       mode,
       includePageMarkdown,
+      includeBlocks,
+      pageMarkers,
     );
   }
 
@@ -65,6 +69,8 @@ export async function scrapePDFWithFirePDFAsync(
     maxPages,
     pagesProcessed,
     includePageMarkdown,
+    includeBlocks,
+    pageMarkers,
   );
   if (cached) return cached;
 
@@ -89,6 +95,8 @@ export async function scrapePDFWithFirePDFAsync(
       pagesProcessed,
       mode,
       includePageMarkdown,
+      includeBlocks,
+      pageMarkers,
     );
   }
 
@@ -122,6 +130,8 @@ export async function scrapePDFWithFirePDFAsync(
       pagesProcessed,
       mode,
       includePageMarkdown,
+      includeBlocks,
+      pageMarkers,
       deadlineAt,
       teamConcurrency,
       fetchImpl,
@@ -182,6 +192,21 @@ export async function scrapePDFWithFirePDFAsync(
       note: "FirePDF result omitted requested physical page markdown",
     });
   }
+  if (includeBlocks && fetched.blocks === undefined) {
+    failAsync(meta, "http_5xx", {
+      note: "FirePDF result omitted requested typed blocks",
+    });
+  }
+  if (pageMarkers && fetched.page_markers !== true) {
+    // Markers are baked into the markdown, so the missing echo is the only
+    // signal the worker build ignored the option; accepting the result
+    // would cache unmarked markdown under a marker cache variant. Fail the
+    // async attempt — the caller retries synchronously, where the same
+    // echo contract applies.
+    failAsync(meta, "http_5xx", {
+      note: "FirePDF result did not acknowledge requested page markers",
+    });
+  }
   const durationMs = now() - overallStartedAt;
   firePdfAsyncTotalDurationSeconds.observe(durationMs / 1000);
 
@@ -191,6 +216,7 @@ export async function scrapePDFWithFirePDFAsync(
     markdownLength: fetched.markdown.length,
     pagesProcessed: pages,
     pageMarkdownPages: fetched.pages?.length,
+    blockPages: fetched.blocks?.length,
     failedPages: fetched.failed_pages,
     partialPages: fetched.partial_pages,
     pollCount: polled.pollCount,
@@ -201,6 +227,7 @@ export async function scrapePDFWithFirePDFAsync(
     html: await safeMarkdownToHtml(fetched.markdown, meta.logger, meta.id),
     pagesProcessed: pages,
     ...(fetched.pages ? { pageMarkdown: fetched.pages } : {}),
+    ...(fetched.blocks ? { blocks: fetched.blocks } : {}),
   };
 
   await maybeSaveResult({
@@ -209,6 +236,8 @@ export async function scrapePDFWithFirePDFAsync(
     mode,
     maxPages,
     includePageMarkdown,
+    includeBlocks,
+    pageMarkers,
     result: processorResult,
   });
 

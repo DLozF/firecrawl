@@ -1,4 +1,5 @@
 import { Response } from "express";
+import { externalRequestId } from "../../lib/external-request-id";
 import { config } from "../../config";
 import {
   RequestWithAuth,
@@ -186,6 +187,7 @@ export async function searchController(
         id: jobId,
         kind: "search",
         api_version: "v2",
+        external_request_id: externalRequestId(req),
         team_id: req.auth.team_id,
         origin: req.body.origin ?? "api",
         integration: req.body.integration,
@@ -325,7 +327,7 @@ export async function searchController(
           via: "search_category",
         },
         response: null,
-        num_results: result.response.developer?.length ?? 0,
+        num_results: result.developerResultsCount,
         time_taken: timeTakenInSeconds,
         // Ensure preview-mode searches don't get a non-zero credits_cost
         // in the research ledger when preview tokens are used.
