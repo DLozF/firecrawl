@@ -5,6 +5,7 @@ x-common-service: &common-service
   # comment out the build: statement and uncomment the image: statement
   # image: ghcr.io/firecrawl/firecrawl
   build: apps/api
+  restart: unless-stopped
 
   ulimits:
     nofile:
@@ -82,6 +83,7 @@ services:
       - ALL
     # Resource limits for Docker Compose (not Swarm)
     cpus: 2.0
+    restart: unless-stopped
     mem_limit: 4G
     memswap_limit: 4G
     logging:
@@ -104,6 +106,7 @@ services:
       NUQ_RABBITMQ_URL: amqp://rabbitmq:5672
       HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-60000}
       ENV: local
+      
     depends_on:
       redis:
         condition: service_started
@@ -121,6 +124,7 @@ services:
     # Resource limits for Docker Compose (not Swarm)
     # Increase if you have more CPU cores/RAM available
     cpus: 4.0
+    restart: unless-stopped
     mem_limit: 8G
     memswap_limit: 8G
 
@@ -133,6 +137,7 @@ services:
 
     networks:
       - backend
+    restart: unless-stopped
     command: redis-server --bind 0.0.0.0
     logging:
       driver: "json-file"
@@ -146,6 +151,7 @@ services:
     networks:
       - backend
     command: rabbitmq-server
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 5s
@@ -164,6 +170,7 @@ services:
     # comment out the build: statement and uncomment the image: statement
     # image: ghcr.io/firecrawl/nuq-postgres:latest
     build: apps/nuq-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -188,6 +195,7 @@ services:
   # fdb-cluster-file volume. Replaces nuq-postgres once stable.
   foundationdb:
     image: foundationdb/foundationdb:7.3.63
+    restart: unless-stopped
     environment:
       FDB_NETWORKING_MODE: container
       FDB_COORDINATOR_PORT: 4500
