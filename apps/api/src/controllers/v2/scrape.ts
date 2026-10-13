@@ -17,6 +17,7 @@ import {
   getTimeoutProcessingDetails,
   TransportableError,
 } from "../../lib/error";
+import { ThirdPartyDataTermsRequiredError } from "../../lib/exchange";
 import { NuQJob } from "../../services/worker/nuq";
 import { checkPermissions } from "../../lib/permissions";
 import {
@@ -49,10 +50,17 @@ import { projectScrapeCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 import { resolveThreatProtection } from "../../lib/threat-protection/request";
 import { emitRejectedScrapeActivityEvent } from "../../lib/siem-logging";
-import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
 import { isAgentInteropSecretValid } from "../../lib/agent-interop";
+import { markAlexandriaActivity } from "../../lib/alexandria-activity";
+import {
+  domainProvidersWithin,
+  lookupDomainProviders,
+} from "../../lib/alexandria-domain-providers";
+import { agentHintsRequested } from "../../middlewares/agent-hints";
+import { DEFAULT_TEAM_LIMITS } from "../../services/autumn/autumn.service";
 
 const AGENT_INTEROP_CONCURRENCY_BOOST = 3;
+const DOMAIN_PROVIDER_HINT_GRACE_MS = 100;
 
 export async function scrapeController(
   req: RequestWithAuth<{}, ScrapeResponse, ScrapeRequest>,
@@ -217,6 +225,13 @@ export async function scrapeController(
           success: false,
           error: "Provider discovery does not support zero data retention.",
         });
+      const domainProviders =
+        agentHintsRequested(req) &&
+        !zeroDataRetention &&
+        !zeroDataRetentionTrace &&
+        !req.auth.team_id.startsWith("preview_keyless_")
+          ? lookupDomainProviders(req.body.url, req.auth.team_id)
+          : undefined;
       const billing: BillingMetadata = {
         ...(req.body.__agentInterop
           ? { endpoint: "agent" as const, jobId }
@@ -267,7 +282,7 @@ export async function scrapeController(
           applyAgentAuthDiscoveryHeader(res);
           return res
             .status(429)
-            .json(await keylessLimitBody(req.auth.team_id, "v2_scrape"));
+            .json(await keylessLimitBody(req.auth.team_id, "v2_scrape", req));
         }
         reservedKeylessCredits = projectedKeylessCredits;
       }
@@ -350,10 +365,8 @@ export async function scrapeController(
         }
         req.on("close", () => aborter.abort());
 
-        const baseConcurrency = await getEffectiveConcurrencyLimit(
-          req.auth.team_id,
-          req.acuc?.org_id ?? null,
-        );
+        const baseConcurrency =
+          req.acuc?.concurrency_limit ?? DEFAULT_TEAM_LIMITS.concurrency_limit;
         const concurrency = boostConcurrency
           ? baseConcurrency * AGENT_INTEROP_CONCURRENCY_BOOST
           : baseConcurrency;
@@ -367,7 +380,7 @@ export async function scrapeController(
           async limited => {
             const jobPriority = await getJobPriority({
               team_id: req.auth.team_id,
-              org_id: req.acuc?.org_id ?? null,
+              acuc: req.acuc,
               basePriority: 10,
             });
 
@@ -593,6 +606,52 @@ export async function scrapeController(
             });
           }
 
+          if (e instanceof ThirdPartyDataTermsRequiredError) {
+            setSpanAttributes(span, {
+              "scrape.status_code": 403,
+            });
+            return res.status(403).json(e.response());
+          }
+
+          if (
+            e.code === "THIRD_PARTY_DATA_NOT_ENABLED" ||
+            e.code === "THIRD_PARTY_DATA_ENRICHMENT_NOT_ENABLED"
+          ) {
+            setSpanAttributes(span, {
+              "scrape.status_code": 403,
+            });
+            return res.status(403).json({
+              success: false,
+              code: e.code,
+              error: e.message,
+            });
+          }
+
+          if (e.code === "THIRD_PARTY_DATA_NOT_FOUND") {
+            setSpanAttributes(span, {
+              "scrape.status_code": 404,
+            });
+            return res.status(404).json({
+              success: false,
+              code: e.code,
+              error: e.message,
+            });
+          }
+
+          if (
+            e.code === "THIRD_PARTY_DATA_UNSUPPORTED_URL" ||
+            e.code === "THIRD_PARTY_DATA_UNSUPPORTED_OPTION"
+          ) {
+            setSpanAttributes(span, {
+              "scrape.status_code": 400,
+            });
+            return res.status(400).json({
+              success: false,
+              code: e.code,
+              error: e.message,
+            });
+          }
+
           const statusCode = timeoutErr ? 408 : 500;
           setSpanAttributes(span, {
             "scrape.status_code": statusCode,
@@ -676,7 +735,8 @@ export async function scrapeController(
         !!hasFormatOfType(req.body.formats, "branding") ||
         !!hasFormatOfType(req.body.formats, "question") ||
         !!hasFormatOfType(req.body.formats, "highlights") ||
-        !!hasFormatOfType(req.body.formats, "query");
+        !!hasFormatOfType(req.body.formats, "query") ||
+        req.body.checkPromptInjection;
 
       if (!usedLlm) {
         const ct = hasFormatOfType(req.body.formats, "changeTracking");
@@ -728,6 +788,12 @@ export async function scrapeController(
               return undefined;
             })
           : undefined;
+      if (tools) markAlexandriaActivity(req.auth.team_id);
+      if (domainProviders)
+        res.locals.agentHintDomainProviders = await domainProvidersWithin(
+          domainProviders,
+          DOMAIN_PROVIDER_HINT_GRACE_MS,
+        );
 
       return res.status(200).json({
         success: true,
