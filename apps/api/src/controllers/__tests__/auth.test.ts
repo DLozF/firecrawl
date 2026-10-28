@@ -23,8 +23,10 @@ import { decryptKeylessSignupToken } from "../../lib/keyless-signup-link";
 import { logger } from "../../lib/logger";
 import { isKeylessIpSuspicious } from "../../lib/spur";
 import { trackKeylessPromptShown } from "../../lib/keyless-prompt-analytics";
+import { mintWorldIdCredential, worldIdSubjectHash } from "../../lib/world-id";
 import { db } from "../../db/connection";
 import { autumnService } from "../../services/autumn/autumn.service";
+import { getRateLimitExperimentVariant } from "../../services/rate-limit-experiment";
 
 vi.mock("../../services/queue-service", () => ({
   getRedisConnection: vi.fn(() => ({
@@ -106,6 +108,10 @@ vi.mock("../../services/autumn/autumn.service", () => ({
   },
 }));
 
+vi.mock("../../services/rate-limit-experiment", () => ({
+  getRateLimitExperimentVariant: vi.fn(),
+}));
+
 vi.mock("../../services/agent-sponsor", () => ({
   getAgentSponsorStatus: vi.fn(),
 }));
@@ -130,6 +136,13 @@ describe("authenticateUser", () => {
   const originalPreviewToken = config.PREVIEW_TOKEN;
   const originalAgentInteropSecret = config.AGENT_INTEROP_SECRET;
   const originalKeylessSignupLinkKeys = config.KEYLESS_SIGNUP_LINK_KEYS;
+  const originalWorldId = {
+    WORLD_ID_ISSUER: config.WORLD_ID_ISSUER,
+    WORLD_ID_CLIENT_ID: config.WORLD_ID_CLIENT_ID,
+    WORLD_ID_CLIENT_SECRET: config.WORLD_ID_CLIENT_SECRET,
+    WORLD_ID_CREDENTIAL_SECRET: config.WORLD_ID_CREDENTIAL_SECRET,
+    WORLD_ID_SUBJECT_SECRET: config.WORLD_ID_SUBJECT_SECRET,
+  };
 
   beforeEach(() => {
     vi.mocked(isKeylessConfigured).mockReturnValue(false);
@@ -150,6 +163,7 @@ describe("authenticateUser", () => {
     config.PREVIEW_TOKEN = originalPreviewToken;
     config.AGENT_INTEROP_SECRET = originalAgentInteropSecret;
     config.KEYLESS_SIGNUP_LINK_KEYS = originalKeylessSignupLinkKeys;
+    Object.assign(config, originalWorldId);
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -393,6 +407,164 @@ describe("authenticateUser", () => {
       ipv4: "198.51.100.7",
       surface: "mcp",
       reason: "limit",
+    });
+  });
+
+  describe("World ID keyless credential", () => {
+    const allowed = {
+      ok: true,
+      requestsUsed: 1,
+      creditsUsed: 0,
+    } as const;
+    const enableWorldId = () => {
+      config.USE_DB_AUTHENTICATION = true;
+      config.WORLD_ID_ISSUER = "https://issuer.test";
+      config.WORLD_ID_CLIENT_ID = "app_test";
+      config.WORLD_ID_CLIENT_SECRET = "client-secret";
+      config.WORLD_ID_CREDENTIAL_SECRET = "c".repeat(32);
+      config.WORLD_ID_SUBJECT_SECRET = "s".repeat(32);
+      vi.mocked(isKeylessConfigured).mockReturnValue(true);
+      vi.mocked(consumeKeylessRequest).mockResolvedValue(allowed);
+    };
+
+    it("gets its own bucket and skips the IP checks", async () => {
+      enableWorldId();
+      const hash = worldIdSubjectHash("https://issuer.test", "human-1");
+      const { credential } = mintWorldIdCredential(hash);
+
+      const auth = await authenticateUser(
+        {
+          body: { origin: "cli" },
+          headers: { "x-firecrawl-world-id": credential },
+          // IPv6 is refused on the IP path; a verified human isn't keyed on it.
+          socket: { remoteAddress: "2001:db8::1" },
+        },
+        {},
+        RateLimiterMode.Scrape,
+        { allowKeyless: true },
+      );
+
+      expect(auth).toMatchObject({
+        success: true,
+        team_id: `preview_keyless_wid_${hash}`,
+      });
+      expect(consumeKeylessRequest).toHaveBeenCalledWith(`wid_${hash}`);
+      expect(isKeylessIpSuspicious).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the IP bucket when the credential is invalid", async () => {
+      enableWorldId();
+
+      const auth = await authenticateUser(
+        {
+          body: { origin: "cli" },
+          headers: { "x-firecrawl-world-id": "fcwid_forged.credential" },
+          socket: { remoteAddress: "203.0.113.8" },
+        },
+        {},
+        RateLimiterMode.Scrape,
+        { allowKeyless: true },
+      );
+
+      expect(auth).toMatchObject({
+        success: true,
+        team_id: "preview_keyless_203.0.113.8",
+      });
+      expect(consumeKeylessRequest).toHaveBeenCalledWith("203.0.113.8");
+      expect(isKeylessIpSuspicious).toHaveBeenCalledWith("203.0.113.8");
+    });
+
+    it("is ignored while World ID is not configured", async () => {
+      enableWorldId();
+      const { credential } = mintWorldIdCredential("h".repeat(43));
+      config.WORLD_ID_CLIENT_SECRET = undefined;
+
+      const auth = await authenticateUser(
+        {
+          body: { origin: "cli" },
+          headers: { "x-firecrawl-world-id": credential },
+          socket: { remoteAddress: "2001:db8::1" },
+        },
+        {},
+        RateLimiterMode.Scrape,
+        { allowKeyless: true },
+      );
+
+      expect(auth).toMatchObject({ success: false, status: 401 });
+      expect(consumeKeylessRequest).not.toHaveBeenCalled();
+    });
+
+    const ipv4Request = (headers: Record<string, string> = {}) => ({
+      body: { origin: "cli" },
+      headers,
+      socket: { remoteAddress: "203.0.113.8" },
+    });
+
+    it("keeps IPv4 callers on the IP bucket and prompt whether or not it is configured", async () => {
+      config.KEYLESS_SIGNUP_LINK_KEYS = "AAECAwQFBgcICQoLDA0ODw==";
+      enableWorldId();
+      vi.mocked(consumeKeylessRequest).mockResolvedValue({
+        ok: false,
+        reason: "credits",
+        requestsUsed: 1,
+        creditsUsed: 100,
+      });
+      const { credential } = mintWorldIdCredential(
+        worldIdSubjectHash("https://issuer.test", "human-1"),
+      );
+      const run = (headers: Record<string, string> = {}) =>
+        authenticateUser(ipv4Request(headers), {}, RateLimiterMode.Scrape, {
+          allowKeyless: true,
+        });
+
+      const configured = await run();
+      const forged = await run({
+        "x-firecrawl-world-id": "fcwid_forged.credential",
+      });
+      config.WORLD_ID_CLIENT_ID = undefined;
+      config.WORLD_ID_CLIENT_SECRET = undefined;
+      config.WORLD_ID_CREDENTIAL_SECRET = undefined;
+      config.WORLD_ID_SUBJECT_SECRET = undefined;
+      const unset = await run();
+      const unsetWithCredential = await run({
+        "x-firecrawl-world-id": credential,
+      });
+
+      const links = [configured, forged, unset, unsetWithCredential].map(
+        auth => {
+          expect(auth).toMatchObject({ success: false, status: 429 });
+          return decodedLink((auth as { signupUrl?: string }).signupUrl);
+        },
+      );
+      expect(links[0]).toMatchObject({ ipv4: "203.0.113.8", reason: "limit" });
+      expect(links).toEqual(Array(4).fill(links[0]));
+      expect(vi.mocked(consumeKeylessRequest).mock.calls).toEqual(
+        Array(4).fill(["203.0.113.8"]),
+      );
+      expect(vi.mocked(isKeylessIpSuspicious).mock.calls).toEqual(
+        Array(4).fill(["203.0.113.8"]),
+      );
+    });
+
+    it("authenticates a credential without calling the issuer", async () => {
+      enableWorldId();
+      const fetch = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+      vi.stubGlobal("fetch", fetch);
+      const hash = worldIdSubjectHash("https://issuer.test", "human-1");
+      const { credential } = mintWorldIdCredential(hash);
+
+      const auth = await authenticateUser(
+        ipv4Request({ "x-firecrawl-world-id": credential }),
+        {},
+        RateLimiterMode.Scrape,
+        { allowKeyless: true },
+      );
+
+      expect(auth).toMatchObject({
+        success: true,
+        team_id: `preview_keyless_wid_${hash}`,
+      });
+      expect(fetch).not.toHaveBeenCalled();
     });
   });
 
@@ -711,11 +883,24 @@ describe("authenticateUser", () => {
     );
   });
 
-  it("rejects a managed OAuth credential on the public REST token path", async () => {
+  it("looks up a REST-audience grant key as a managed credential", async () => {
     config.USE_DB_AUTHENTICATION = true;
     config.OAUTH_INTROSPECT_URL = "https://example.test/introspect";
     config.OAUTH_INTROSPECT_SECRET = "secret";
     vi.mocked(getValue).mockResolvedValue(null);
+    vi.mocked(authCreditUsageChunk).mockResolvedValue([
+      {
+        api_key: "11111111-1111-1111-8111-111111111111",
+        api_key_id: 1,
+        team_id: "team-1",
+        org_id: "org-1",
+        flags: null,
+      },
+    ]);
+    mockMultiplier(1);
+    vi.mocked(getAutumnRateLimiter).mockReturnValue({
+      consume: vi.fn().mockResolvedValue(undefined),
+    } as never);
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -744,9 +929,52 @@ describe("authenticateUser", () => {
       RateLimiterMode.Scrape,
     );
 
+    expect(auth).toEqual(
+      expect.objectContaining({ success: true, team_id: "team-1" }),
+    );
+    expect(authCreditUsageChunk).toHaveBeenCalledWith(
+      expect.anything(),
+      "11111111-1111-1111-8111-111111111111",
+      "hosted_mcp_oauth",
+    );
+  });
+
+  it("rejects a grant key whose audience is hosted MCP", async () => {
+    config.USE_DB_AUTHENTICATION = true;
+    config.OAUTH_INTROSPECT_URL = "https://example.test/introspect";
+    config.OAUTH_INTROSPECT_SECRET = "secret";
+    vi.mocked(getValue).mockResolvedValue(null);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            active: true,
+            api_key: "fc-11111111111111118111111111111111",
+            scope: "firecrawl:global",
+            client_id: "client-1",
+            team_id: "team-1",
+            exp: Math.floor(Date.now() / 1000) + 60,
+            aud: "https://mcp.firecrawl.dev/v2/mcp",
+            credential_purpose: "hosted_mcp_oauth",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const auth = await authenticateUser(
+      {
+        headers: { authorization: "Bearer fco_managed_token" },
+        socket: { remoteAddress: "127.0.0.1" },
+      },
+      {},
+      RateLimiterMode.Scrape,
+    );
+
     expect(auth).toEqual({
       success: false,
-      error: "Unauthorized: Invalid token",
+      error: "Unauthorized: Invalid or expired OAuth token",
       status: 401,
     });
     expect(authCreditUsageChunk).not.toHaveBeenCalled();
@@ -878,6 +1106,88 @@ describe("authenticateUser", () => {
     );
   });
 
+  describe("rate-limit experiment", () => {
+    const request = {
+      headers: {
+        authorization: "Bearer 00000000-0000-4000-8000-000000000000",
+      },
+      socket: { remoteAddress: "127.0.0.1" },
+    };
+    const chunkWith = (extra: Record<string, unknown> = {}) => [
+      {
+        api_key: "00000000-0000-4000-8000-000000000000",
+        api_key_id: 1,
+        team_id: "team-1",
+        org_id: "org-1",
+        flags: {},
+        ...extra,
+      },
+    ];
+
+    beforeEach(() => {
+      config.USE_DB_AUTHENTICATION = true;
+      vi.mocked(getValue).mockResolvedValue(null);
+      vi.mocked(authCreditUsageChunk).mockResolvedValue(chunkWith());
+      vi.mocked(redlock.using).mockImplementation(
+        async (_keys, _ttl, _options, fn) => fn({ aborted: false } as never),
+      );
+      mockMultiplier(1);
+    });
+
+    it("gives a treatment org the raised limit", async () => {
+      vi.mocked(getRateLimitExperimentVariant).mockResolvedValue("treatment");
+
+      const auth = await authenticateUser(request, {}, RateLimiterMode.Scrape);
+
+      expect(auth.success).toBe(true);
+      expect(getRateLimitExperimentVariant).toHaveBeenCalledExactlyOnceWith({
+        orgId: "org-1",
+        teamId: "team-1",
+        apiKeyId: 1,
+        rateLimitMultiplier: 1,
+        isPaidPlan: false,
+      });
+      expect(getAutumnRateLimiter).toHaveBeenLastCalledWith(
+        RateLimiterMode.Scrape,
+        1,
+        {},
+        "treatment",
+      );
+    });
+
+    it("keeps the current limit for a control or unenrolled org", async () => {
+      for (const variant of ["control", undefined] as const) {
+        vi.mocked(getAutumnRateLimiter).mockClear();
+        vi.mocked(getRateLimitExperimentVariant).mockResolvedValue(variant);
+
+        await authenticateUser(request, {}, RateLimiterMode.Scrape);
+
+        expect(getAutumnRateLimiter).toHaveBeenCalledExactlyOnceWith(
+          RateLimiterMode.Scrape,
+          1,
+          {},
+        );
+      }
+    });
+
+    it("does not ask for a variant where it cannot change the limit", async () => {
+      await authenticateUser(request, {}, RateLimiterMode.Map);
+
+      expect(getRateLimitExperimentVariant).not.toHaveBeenCalled();
+    });
+
+    it("does not enroll a request denied by the auth checks", async () => {
+      vi.mocked(authCreditUsageChunk).mockResolvedValue(
+        chunkWith({ is_banned: true }),
+      );
+
+      const auth = await authenticateUser(request, {}, RateLimiterMode.Scrape);
+
+      expect(auth.success).toBe(false);
+      expect(getRateLimitExperimentVariant).not.toHaveBeenCalled();
+    });
+  });
+
   describe("agent interop rate-limit floor", () => {
     const flags = {};
     const agentRequest = (auth: string) => ({
@@ -920,6 +1230,10 @@ describe("authenticateUser", () => {
         RateLimiterMode.Scrape,
         HOBBY_RATE_LIMIT_MULTIPLIER,
         flags,
+      );
+      // The experiment records the team's plan, not the floor.
+      expect(getRateLimitExperimentVariant).toHaveBeenCalledWith(
+        expect.objectContaining({ rateLimitMultiplier: 1, isPaidPlan: false }),
       );
     });
 
